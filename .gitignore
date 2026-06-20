@@ -1,0 +1,40 @@
+# Build outputs — CMake build dir, including FetchContent clones of
+# gRPC/protobuf/abseil (hundreds of MB, all reproducible from CMakeLists.txt).
+/build/
+/build_debug/
+/cmake-build-*/
+
+# Compiled artifacts anywhere in the tree.
+*.o
+*.a
+*.so
+*.so.*
+*.exe
+
+# Generated proto stubs live under build/ — never committed.
+*.pb.cc
+*.pb.h
+*.grpc.pb.cc
+*.grpc.pb.h
+
+# In-source CMake metadata leakage.
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Editor / IDE / OS
+.vscode/
+.idea/
+.cache/
+.claude/
+*.swp
+*~
+.DS_Store
+
+# Core dumps
+core
+core.*
+
+# Runtime / benchmark logs (e.g. fullscan.log from ingest runs)
+*.log
