@@ -185,6 +185,22 @@ struct UtxoJson {
     int64_t height = 0;
 };
 
+// z_gettreestate result (the fields we use; finalRoot/sprout are ignored).
+struct CommitmentsJson {
+    std::string finalState{};
+};
+struct TreePoolJson {
+    CommitmentsJson commitments{};
+    std::string skipHash{};
+};
+struct TreeStateJson {
+    int64_t height = 0;
+    std::string hash{};
+    uint32_t time = 0;
+    TreePoolJson sapling{};
+    TreePoolJson orchard{};  // absent on Ycash -> empty
+};
+
 // One element of a JSON-RPC batch response. The result is captured as raw JSON
 // text (deferred parse — no DOM of the whole batch); id routes it to its slot.
 struct BatchElem {
@@ -623,6 +639,46 @@ std::vector<AddressUtxo> RpcClient::GetAddressUtxos(
     for (auto& u : js) {
         out.push_back({std::move(u.address), std::move(u.txid), u.outputIndex,
                        std::move(u.script), u.satoshis, u.height});
+    }
+    return out;
+}
+
+TreeStateResult RpcClient::GetTreeState(const std::string& arg) {
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "z_gettreestate", "[\"" + arg + "\"]"));
+    }
+    TreeStateJson j = ParseReply<TreeStateJson>("z_gettreestate", resp);
+    return {j.height,
+            std::move(j.hash),
+            j.time,
+            std::move(j.sapling.commitments.finalState),
+            std::move(j.sapling.skipHash),
+            std::move(j.orchard.commitments.finalState)};
+}
+
+SendResult RpcClient::SendRawTransaction(const std::string& tx_hex) {
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(
+            SingleBody(++id_, "sendrawtransaction", "[\"" + tx_hex + "\"]"));
+    }
+    ReplyJson<glz::raw_json> r;
+    if (glz::read<kReadOpts>(r, resp)) {
+        throw std::runtime_error("sendrawtransaction: bad JSON reply");
+    }
+    SendResult out;
+    if (r.error) {
+        out.ok = false;
+        out.error_code = r.error->code;
+        out.error_message = std::move(r.error->message);
+    } else if (r.result) {
+        out.ok = true;
+        out.result = std::move(r.result->str);  // raw result JSON (quoted txid)
+    } else {
+        throw std::runtime_error("sendrawtransaction: null result");
     }
     return out;
 }

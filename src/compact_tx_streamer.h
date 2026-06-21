@@ -63,6 +63,19 @@ public:
         grpc::ServerContext* ctx, const rpc::GetAddressUtxosArg* req,
         grpc::ServerWriter<rpc::GetAddressUtxosReply>* writer) override;
 
+    // ---- Spend path (daemon-backed) ----
+
+    grpc::Status SendTransaction(grpc::ServerContext* ctx,
+                                 const rpc::RawTransaction* req,
+                                 rpc::SendResponse* resp) override;
+
+    grpc::Status GetTreeState(grpc::ServerContext* ctx, const rpc::BlockID* req,
+                              rpc::TreeState* resp) override;
+
+    grpc::Status GetLatestTreeState(grpc::ServerContext* ctx,
+                                    const rpc::Empty* req,
+                                    rpc::TreeState* resp) override;
+
 private:
     BlockCache* cache_;  // not owned
     RpcClient* rpc_;     // not owned; may be null (cache-only serving)

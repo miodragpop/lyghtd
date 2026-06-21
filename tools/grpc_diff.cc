@@ -252,6 +252,66 @@ int main(int argc, char** argv) {
                        : (std::to_string(n) + " transactions"));
     }
 
+    // ====================================================================
+    // Spend path (daemon-backed): z_gettreestate + sendrawtransaction.
+    // ====================================================================
+
+    // --- GetTreeState at a fixed height ---
+    {
+        rpc::BlockID req;
+        req.set_height(1500000);
+        rpc::TreeState a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->GetTreeState(&c1, req, &a);
+        auto so = O->GetTreeState(&c2, req, &b);
+        Check("GetTreeState(1500000) byte-identical to oracle",
+              sl.ok() && so.ok() && Ser(a) == Ser(b),
+              sl.ok() && so.ok()
+                  ? ("h" + std::to_string(a.height()) + ", saplingTree " +
+                     std::to_string(a.saplingtree().size()) + "B, orchard " +
+                     std::to_string(a.orchardtree().size()) + "B")
+                  : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // --- GetLatestTreeState (tip can advance between the two calls) ---
+    {
+        rpc::Empty req;
+        rpc::TreeState a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->GetLatestTreeState(&c1, req, &a);
+        auto so = O->GetLatestTreeState(&c2, req, &b);
+        // If the tip raced, heights differ — still a pass; else must be identical.
+        bool ok = sl.ok() && so.ok() &&
+                  (a.height() != b.height() || Ser(a) == Ser(b));
+        Check("GetLatestTreeState matches oracle (or tip raced)", ok,
+              sl.ok() && so.ok()
+                  ? ("lyghtd h" + std::to_string(a.height()) + " / oracle h" +
+                     std::to_string(b.height()))
+                  : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // --- SendTransaction: resubmit an already-confirmed tx; ycashd rejects it
+    //     identically on both servers (no real broadcast happens). ---
+    {
+        rpc::TxFilter tf;
+        tf.set_hash(Rev(Unhex(kTxidBE)));
+        rpc::RawTransaction tx;
+        grpc::ClientContext c0;
+        auto sg = L->GetTransaction(&c0, tf, &tx);
+        rpc::RawTransaction send_req;
+        send_req.set_data(tx.data());
+        rpc::SendResponse a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->SendTransaction(&c1, send_req, &a);
+        auto so = O->SendTransaction(&c2, send_req, &b);
+        Check("SendTransaction(confirmed tx) rejects identically to oracle",
+              sg.ok() && sl.ok() && so.ok() && Ser(a) == Ser(b),
+              sl.ok() && so.ok()
+                  ? ("code " + std::to_string(a.errorcode()) + " msg '" +
+                     a.errormessage() + "'")
+                  : (sl.error_message() + " / " + so.error_message()));
+    }
+
     std::cout << (g_fail == 0 ? "\nALL CHECKS PASSED\n"
                               : "\n" + std::to_string(g_fail) + " CHECK(S) FAILED\n");
     return g_fail == 0 ? 0 : 1;

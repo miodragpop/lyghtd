@@ -64,6 +64,27 @@ struct AddressUtxo {
     int64_t height = 0;
 };
 
+// z_gettreestate result. orchard_final is empty on chains without Orchard
+// (Ycash); sapling_skip_hash drives the pre-Sapling walk-back in the gRPC layer.
+struct TreeStateResult {
+    int64_t height = 0;
+    std::string hash;
+    uint32_t time = 0;
+    std::string sapling_final;     // sapling.commitments.finalState
+    std::string sapling_skip_hash; // sapling.skipHash
+    std::string orchard_final;     // orchard.commitments.finalState
+};
+
+// sendrawtransaction result. On success `result` is the raw result JSON (the
+// quoted txid, kept verbatim like Go lightwalletd); on an RPC-level error the
+// daemon's code/message are returned instead of throwing.
+struct SendResult {
+    bool ok = false;
+    std::string result;
+    int error_code = 0;
+    std::string error_message;
+};
+
 class RpcClient {
 public:
     // Build a client from a ycashd/zcashd conf file (rpcuser/rpcpassword/rpcport).
@@ -153,6 +174,15 @@ public:
     // getaddressutxos — unspent outputs for `addresses` (insightexplorer).
     std::vector<AddressUtxo> GetAddressUtxos(
         const std::vector<std::string>& addresses);
+
+    // z_gettreestate <arg>, where `arg` is a decimal height string or a block
+    // hash hex (passed as a JSON string). One call; the caller drives any
+    // skipHash walk-back. Throws on RPC error.
+    TreeStateResult GetTreeState(const std::string& arg);
+
+    // sendrawtransaction <tx_hex>. Returns the structured result/error WITHOUT
+    // throwing on an RPC-level rejection (the caller maps it into SendResponse).
+    SendResult SendRawTransaction(const std::string& tx_hex);
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }

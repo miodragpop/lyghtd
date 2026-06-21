@@ -398,4 +398,88 @@ grpc::Status CompactTxStreamerImpl::GetAddressUtxosStream(
     });
 }
 
+// ---- Spend path (daemon-backed) ----
+
+grpc::Status CompactTxStreamerImpl::SendTransaction(grpc::ServerContext*,
+                                                    const rpc::RawTransaction* req,
+                                                    rpc::SendResponse* resp) {
+    if (!rpc_) return NoRpc();
+    if (req->data().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "bad transaction data");
+    }
+    SendResult sr;
+    try {
+        sr = rpc_->SendRawTransaction(ToHex(req->data()));
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::UNKNOWN, e.what());
+    }
+    // On success: code 0, message = the raw quoted txid (matches Go). On an RPC
+    // rejection: the daemon's code/message, still a normal (OK) response.
+    if (sr.ok) {
+        resp->set_errorcode(0);
+        resp->set_errormessage(sr.result);
+    } else {
+        resp->set_errorcode(sr.error_code);
+        resp->set_errormessage(sr.error_message);
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status CompactTxStreamerImpl::GetTreeState(grpc::ServerContext* ctx,
+                                                 const rpc::BlockID* req,
+                                                 rpc::TreeState* resp) {
+    if (!rpc_) return NoRpc();
+    if (req->height() == 0 && req->hash().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "must specify a block height or ID (hash)");
+    }
+    // z_gettreestate takes a height (as a decimal string) or a block hash hex.
+    // BlockID.hash is big-endian — kept as-is (no reversal).
+    std::string arg = req->height() > 0 ? std::to_string(req->height())
+                                        : ToHex(req->hash());
+
+    TreeStateResult ts;
+    for (;;) {  // walk back via skipHash for pre-Sapling heights
+        if (ctx->IsCancelled()) {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "client cancelled");
+        }
+        try {
+            ts = rpc_->GetTreeState(arg);
+        } catch (const std::exception& e) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                std::string("z_gettreestate failed: ") + e.what());
+        }
+        if (!ts.sapling_final.empty() || ts.sapling_skip_hash.empty()) break;
+        arg = ts.sapling_skip_hash;
+    }
+    if (ts.sapling_final.empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "z_gettreestate did not return treestate");
+    }
+    resp->set_network(kChainName);
+    resp->set_height(static_cast<uint64_t>(ts.height));
+    resp->set_hash(ts.hash);
+    resp->set_time(ts.time);
+    resp->set_saplingtree(ts.sapling_final);
+    resp->set_orchardtree(ts.orchard_final);
+    return grpc::Status::OK;
+}
+
+grpc::Status CompactTxStreamerImpl::GetLatestTreeState(grpc::ServerContext* ctx,
+                                                       const rpc::Empty*,
+                                                       rpc::TreeState* resp) {
+    if (!rpc_) return NoRpc();
+    uint64_t tip = 0;
+    try {
+        tip = rpc_->GetBlockChainInfo().blocks;
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                            std::string("getblockchaininfo failed: ") + e.what());
+    }
+    rpc::BlockID id;
+    id.set_height(tip);
+    return GetTreeState(ctx, &id, resp);
+}
+
 }  // namespace lyghtd
