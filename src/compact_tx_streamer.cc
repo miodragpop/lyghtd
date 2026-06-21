@@ -1,6 +1,11 @@
 #include "compact_tx_streamer.h"
 
 #include <algorithm>
+#include <cctype>
+#include <exception>
+#include <functional>
+#include <string>
+#include <vector>
 
 #include "Version.h"
 
@@ -43,6 +48,131 @@ void FilterShieldedOnly(rpc::CompactBlock* block) {
         // vin/vout intentionally dropped (transparent pool not requested).
     }
     block->mutable_vtx()->Swap(&kept);
+}
+
+// ---- Transparent-address-suite helpers ----
+
+grpc::Status NoRpc() {
+    return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                        "no ycashd connection configured");
+}
+
+// Ycash transparent address: 's' + 34 alphanumeric (P2PKH s1.., P2SH s3..).
+// Upstream lightwalletd checks a 't' prefix; Ycash uses 's'.
+grpc::Status CheckTaddress(const std::string& a) {
+    const bool ok =
+        a.size() == 35 && a[0] == 's' &&
+        std::all_of(a.begin(), a.end(),
+                    [](unsigned char c) { return std::isalnum(c) != 0; });
+    if (!ok) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "transparent address contains invalid characters: " + a);
+    }
+    return grpc::Status::OK;
+}
+
+std::string HexDecode(const std::string& hex) {
+    auto nib = [](char c) -> int {
+        return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+    };
+    std::string out;
+    out.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        out.push_back(static_cast<char>((nib(hex[i]) << 4) | nib(hex[i + 1])));
+    }
+    return out;
+}
+
+std::string ToHex(const std::string& b) {
+    static const char* k = "0123456789abcdef";
+    std::string out;
+    out.reserve(b.size() * 2);
+    for (unsigned char c : b) {
+        out.push_back(k[c >> 4]);
+        out.push_back(k[c & 0xf]);
+    }
+    return out;
+}
+
+std::string Reversed(const std::string& s) {
+    return std::string(s.rbegin(), s.rend());
+}
+
+// Map a ycashd address-RPC error string to a gRPC code, like Go lightwalletd.
+grpc::Status MapAddrErr(const std::exception& e) {
+    const std::string m = e.what();
+    if (m.find("Invalid address") != std::string::npos) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, m);
+    }
+    if (m.find("No information available") != std::string::npos) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND, m);
+    }
+    return grpc::Status(grpc::StatusCode::UNKNOWN, m);
+}
+
+// Fetch one tx by big-endian display-hex txid into `out` (getrawtransaction).
+grpc::Status FetchRawTx(RpcClient* rpc, const std::string& txid_be_hex,
+                        rpc::RawTransaction* out) {
+    try {
+        RawTx t = rpc->GetRawTransaction(txid_be_hex);
+        out->set_data(t.data);
+        // Reinterpret int64 height as uint64 exactly like Go (−1 -> fork
+        // sentinel, 0 -> mempool).
+        out->set_height(static_cast<uint64_t>(t.height));
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::NOT_FOUND,
+                            std::string("getrawtransaction failed: ") + e.what());
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status BalanceOf(RpcClient* rpc, const std::vector<std::string>& addrs,
+                       rpc::Balance* resp) {
+    for (const auto& a : addrs) {
+        grpc::Status st = CheckTaddress(a);
+        if (!st.ok()) return st;
+    }
+    try {
+        resp->set_valuezat(rpc->GetAddressBalance(addrs));
+    } catch (const std::exception& e) {
+        return MapAddrErr(e);
+    }
+    return grpc::Status::OK;
+}
+
+// Shared getaddressutxos path: validate, fetch, filter by startHeight/maxEntries,
+// map to GetAddressUtxosReply (txid -> wire order), and hand each to `emit`.
+grpc::Status ForEachUtxo(
+    RpcClient* rpc, const rpc::GetAddressUtxosArg* arg,
+    const std::function<grpc::Status(const rpc::GetAddressUtxosReply&)>& emit) {
+    std::vector<std::string> addrs(arg->addresses().begin(),
+                                   arg->addresses().end());
+    for (const auto& a : addrs) {
+        grpc::Status st = CheckTaddress(a);
+        if (!st.ok()) return st;
+    }
+    std::vector<AddressUtxo> utxos;
+    try {
+        utxos = rpc->GetAddressUtxos(addrs);
+    } catch (const std::exception& e) {
+        return MapAddrErr(e);
+    }
+    uint32_t n = 0;
+    for (const auto& u : utxos) {
+        if (static_cast<uint64_t>(u.height) < arg->startheight()) continue;
+        ++n;
+        if (arg->maxentries() > 0 && n > arg->maxentries()) break;
+        rpc::GetAddressUtxosReply r;
+        r.set_address(u.address);
+        r.set_txid(Reversed(HexDecode(u.txid)));  // wire (little-endian) order
+        r.set_index(static_cast<int32_t>(u.output_index));
+        r.set_script(HexDecode(u.script));
+        r.set_valuezat(static_cast<int64_t>(u.satoshis));
+        r.set_height(static_cast<uint64_t>(u.height));
+        grpc::Status s = emit(r);
+        if (!s.ok()) return s;
+    }
+    return grpc::Status::OK;
 }
 
 }  // namespace
@@ -170,6 +300,102 @@ grpc::Status CompactTxStreamerImpl::GetBlockRange(
         }
     }
     return grpc::Status::OK;
+}
+
+// ---- Transparent-address suite (daemon-backed) ----
+
+grpc::Status CompactTxStreamerImpl::GetTransaction(grpc::ServerContext*,
+                                                   const rpc::TxFilter* req,
+                                                   rpc::RawTransaction* resp) {
+    if (!rpc_) return NoRpc();
+    if (!req->hash().empty()) {
+        if (req->hash().size() != 32) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "transaction ID has invalid length");
+        }
+        // hash is wire (little-endian) order; getrawtransaction wants big-endian
+        // display hex.
+        return FetchRawTx(rpc_, ToHex(Reversed(req->hash())), resp);
+    }
+    return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "specify a txid");
+}
+
+grpc::Status CompactTxStreamerImpl::GetTaddressTransactions(
+    grpc::ServerContext*, const rpc::TransparentAddressBlockFilter* req,
+    grpc::ServerWriter<rpc::RawTransaction>* writer) {
+    if (!rpc_) return NoRpc();
+    grpc::Status st = CheckTaddress(req->address());
+    if (!st.ok()) return st;
+    if (!req->has_range() || !req->range().has_start()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "must specify a start block height");
+    }
+    const uint64_t start = req->range().start().height();
+    const uint64_t end = req->range().has_end() ? req->range().end().height() : 0;
+
+    std::vector<std::string> txids;
+    try {
+        txids = rpc_->GetAddressTxids({req->address()}, start, end);
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            std::string("getaddresstxids failed: ") + e.what());
+    }
+    for (const auto& txid_be : txids) {
+        rpc::RawTransaction tx;
+        grpc::Status s = FetchRawTx(rpc_, txid_be, &tx);
+        if (!s.ok()) return s;
+        if (!writer->Write(tx)) {
+            return grpc::Status(grpc::StatusCode::UNKNOWN, "stream write failed");
+        }
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status CompactTxStreamerImpl::GetTaddressTxids(
+    grpc::ServerContext* ctx, const rpc::TransparentAddressBlockFilter* req,
+    grpc::ServerWriter<rpc::RawTransaction>* writer) {
+    // Deprecated alias — identical to GetTaddressTransactions (matches Go).
+    return GetTaddressTransactions(ctx, req, writer);
+}
+
+grpc::Status CompactTxStreamerImpl::GetTaddressBalance(grpc::ServerContext*,
+                                                       const rpc::AddressList* req,
+                                                       rpc::Balance* resp) {
+    if (!rpc_) return NoRpc();
+    return BalanceOf(rpc_, {req->addresses().begin(), req->addresses().end()},
+                     resp);
+}
+
+grpc::Status CompactTxStreamerImpl::GetTaddressBalanceStream(
+    grpc::ServerContext*, grpc::ServerReader<rpc::Address>* reader,
+    rpc::Balance* resp) {
+    if (!rpc_) return NoRpc();
+    std::vector<std::string> addrs;
+    rpc::Address a;
+    while (reader->Read(&a)) addrs.push_back(a.address());
+    return BalanceOf(rpc_, addrs, resp);
+}
+
+grpc::Status CompactTxStreamerImpl::GetAddressUtxos(
+    grpc::ServerContext*, const rpc::GetAddressUtxosArg* req,
+    rpc::GetAddressUtxosReplyList* resp) {
+    if (!rpc_) return NoRpc();
+    return ForEachUtxo(rpc_, req, [resp](const rpc::GetAddressUtxosReply& r) {
+        *resp->add_addressutxos() = r;
+        return grpc::Status::OK;
+    });
+}
+
+grpc::Status CompactTxStreamerImpl::GetAddressUtxosStream(
+    grpc::ServerContext*, const rpc::GetAddressUtxosArg* req,
+    grpc::ServerWriter<rpc::GetAddressUtxosReply>* writer) {
+    if (!rpc_) return NoRpc();
+    return ForEachUtxo(rpc_, req, [writer](const rpc::GetAddressUtxosReply& r) {
+        if (!writer->Write(r)) {
+            return grpc::Status(grpc::StatusCode::UNKNOWN, "stream write failed");
+        }
+        return grpc::Status::OK;
+    });
 }
 
 }  // namespace lyghtd

@@ -148,7 +148,20 @@ int main(int argc, char** argv) {
               << chain << ", " << cache->Count() << " blocks, tip height "
               << (tip ? std::to_string(*tip) : std::string("none")) << ")\n";
 
-    lyghtd::CompactTxStreamerImpl service(cache.get());
+    // A dedicated ycashd client for the daemon-backed RPCs (transparent-address
+    // suite, GetTransaction) — separate from the ingestor's connection so
+    // serving and ingest don't contend on one curl handle. Optional: if ycashd
+    // isn't configured, those RPCs return UNAVAILABLE but cache serving works.
+    std::unique_ptr<lyghtd::RpcClient> service_rpc;
+    try {
+        service_rpc = std::make_unique<lyghtd::RpcClient>(
+            lyghtd::RpcClient::FromConf(conf));
+    } catch (const std::exception& e) {
+        std::cerr << "lyghtd: no ycashd client for daemon-backed RPCs (" << e.what()
+                  << "); transparent-address RPCs will return UNAVAILABLE\n";
+    }
+
+    lyghtd::CompactTxStreamerImpl service(cache.get(), service_rpc.get());
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();

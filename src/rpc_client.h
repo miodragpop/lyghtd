@@ -45,6 +45,25 @@ struct DaemonInfo {
     std::string subversion;
 };
 
+// A transaction from getrawtransaction: raw bytes + mined height. `height` keeps
+// the daemon's int64 (−1 = mined on a non-main-chain fork, 0/absent = mempool);
+// the gRPC layer reinterprets it as uint64 exactly like Go lightwalletd.
+struct RawTx {
+    std::string data;     // binary transaction bytes
+    int64_t height = 0;
+};
+
+// One entry of getaddressutxos (insightexplorer). txid/script stay hex here; the
+// gRPC layer decodes + reverses txid to wire order.
+struct AddressUtxo {
+    std::string address;
+    std::string txid;          // big-endian display hex
+    int64_t output_index = 0;
+    std::string script;        // hex
+    uint64_t satoshis = 0;
+    int64_t height = 0;
+};
+
 class RpcClient {
 public:
     // Build a client from a ycashd/zcashd conf file (rpcuser/rpcpassword/rpcport).
@@ -116,6 +135,24 @@ public:
     // hex straight during JSON parse). The single-call fast path: ycashd does the
     // block->CompactBlock work, so the bytes are stored verbatim. count <= 10000.
     std::vector<std::string> GetCompactBlockRange(uint64_t start, uint64_t count);
+
+    // ---- Daemon-backed RPCs for the transparent-address suite ----
+
+    // getrawtransaction <txid> 1. `txid_be_hex` is big-endian display hex.
+    // Throws on a not-found / RPC error.
+    RawTx GetRawTransaction(const std::string& txid_be_hex);
+
+    // getaddressbalance — total confirmed balance (Zatoshis) over `addresses`.
+    int64_t GetAddressBalance(const std::vector<std::string>& addresses);
+
+    // getaddresstxids — txids (big-endian display hex) touching `addresses`
+    // within [start, end] (end omitted if 0), in chain order.
+    std::vector<std::string> GetAddressTxids(
+        const std::vector<std::string>& addresses, uint64_t start, uint64_t end);
+
+    // getaddressutxos — unspent outputs for `addresses` (insightexplorer).
+    std::vector<AddressUtxo> GetAddressUtxos(
+        const std::vector<std::string>& addresses);
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }

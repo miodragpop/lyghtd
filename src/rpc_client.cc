@@ -163,6 +163,28 @@ struct InfoJson {
     std::string subversion{};
 };
 
+// getrawtransaction verbosity-1 result (only the fields we use). The hex tx is
+// decoded straight to binary in-parse; height is absent for mempool txs.
+struct RawTxJson {
+    HexBytes hex{};
+    std::optional<int64_t> height{};
+};
+
+// getaddressbalance result (balance in Zatoshis; received/txcount ignored).
+struct BalanceJson {
+    int64_t balance = 0;
+};
+
+// One getaddressutxos element (insightexplorer). Field names match the JSON.
+struct UtxoJson {
+    std::string address{};
+    std::string txid{};
+    int64_t outputIndex = 0;
+    std::string script{};
+    uint64_t satoshis = 0;
+    int64_t height = 0;
+};
+
 // One element of a JSON-RPC batch response. The result is captured as raw JSON
 // text (deferred parse — no DOM of the whole batch); id routes it to its slot.
 struct BatchElem {
@@ -534,6 +556,74 @@ std::vector<std::string> RpcClient::GetCompactBlockRange(uint64_t start,
     }
     std::vector<std::string> out(count);
     for (uint64_t i = 0; i < count; ++i) out[i] = std::move(elems[i].bytes);
+    return out;
+}
+
+// JSON array of quoted address strings (addresses are validated t-addresses —
+// alphanumeric — so no escaping is needed): {"a","b"} -> "a","b".
+static std::string JoinQuoted(const std::vector<std::string>& v) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (i) s += ',';
+        s += '"';
+        s += v[i];
+        s += '"';
+    }
+    return s;
+}
+
+RawTx RpcClient::GetRawTransaction(const std::string& txid_be_hex) {
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "getrawtransaction",
+                                   "[\"" + txid_be_hex + "\",1]"));
+    }
+    RawTxJson j = ParseReply<RawTxJson>("getrawtransaction", resp);
+    return RawTx{std::move(j.hex.bytes), j.height.value_or(0)};
+}
+
+int64_t RpcClient::GetAddressBalance(const std::vector<std::string>& addresses) {
+    const std::string params =
+        "[{\"addresses\":[" + JoinQuoted(addresses) + "]}]";
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "getaddressbalance", params));
+    }
+    return ParseReply<BalanceJson>("getaddressbalance", resp).balance;
+}
+
+std::vector<std::string> RpcClient::GetAddressTxids(
+    const std::vector<std::string>& addresses, uint64_t start, uint64_t end) {
+    std::string params = "[{\"addresses\":[" + JoinQuoted(addresses) +
+                         "],\"start\":" + std::to_string(start);
+    if (end) params += ",\"end\":" + std::to_string(end);
+    params += "}]";
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "getaddresstxids", params));
+    }
+    return ParseReply<std::vector<std::string>>("getaddresstxids", resp);
+}
+
+std::vector<AddressUtxo> RpcClient::GetAddressUtxos(
+    const std::vector<std::string>& addresses) {
+    const std::string params =
+        "[{\"addresses\":[" + JoinQuoted(addresses) + "]}]";
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "getaddressutxos", params));
+    }
+    auto js = ParseReply<std::vector<UtxoJson>>("getaddressutxos", resp);
+    std::vector<AddressUtxo> out;
+    out.reserve(js.size());
+    for (auto& u : js) {
+        out.push_back({std::move(u.address), std::move(u.txid), u.outputIndex,
+                       std::move(u.script), u.satoshis, u.height});
+    }
     return out;
 }
 

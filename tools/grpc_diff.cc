@@ -10,6 +10,7 @@
 // lyghtd's snapshot; the tool checks lyghtd's tip block against the oracle's
 // block AT THAT SAME HEIGHT instead, which must match.
 
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -31,9 +32,16 @@ std::unique_ptr<rpc::CompactTxStreamer::Stub> MakeStub(const std::string& a) {
 }
 
 void Check(const std::string& name, bool ok, const std::string& detail = "") {
-    std::cout << (ok ? "  PASS " : "  FAIL ") << name;
+    // Time since the previous Check() == the work this check just did, so slow
+    // RPCs stand out. std::endl flushes, so progress streams (no buffering).
+    static auto last = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last)
+                  .count();
+    last = now;
+    std::cout << (ok ? "  PASS " : "  FAIL ") << "[" << ms << "ms] " << name;
     if (!detail.empty()) std::cout << " — " << detail;
-    std::cout << "\n";
+    std::cout << std::endl;
     if (!ok) ++g_fail;
 }
 
@@ -52,6 +60,18 @@ std::string Hex(const std::string& s) {
         out.push_back(d[c & 0xf]);
     }
     return out;
+}
+
+std::string Unhex(const std::string& h) {
+    auto nib = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    std::string o;
+    for (size_t i = 0; i + 1 < h.size(); i += 2)
+        o.push_back(static_cast<char>((nib(h[i]) << 4) | nib(h[i + 1])));
+    return o;
+}
+
+std::string Rev(const std::string& s) {
+    return std::string(s.rbegin(), s.rend());
 }
 
 }  // namespace
@@ -146,6 +166,90 @@ int main(int argc, char** argv) {
               mismatch ? ("mismatch at height " + std::to_string(mismatch_h))
                        : (std::to_string(n) + " blocks, " +
                           std::to_string(shielded) + " shielded txs"));
+    }
+
+    // ====================================================================
+    // Transparent-address suite (daemon-backed; both servers proxy the same
+    // ycashd, so responses must be byte-identical).
+    // ====================================================================
+    const std::string kAddr = "s1Z9YqM2h48HUf8kcSHS89q4Z6Bg9xua3kA";
+    const std::string kTxidBE =
+        "7db8273bb3ebbaddfbe14add36005d57339792a6d45fcb489cbb98cfb38da50b";
+
+    // --- GetTaddressBalance ---
+    {
+        rpc::AddressList req;
+        req.add_addresses(kAddr);
+        rpc::Balance a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->GetTaddressBalance(&c1, req, &a);
+        auto so = O->GetTaddressBalance(&c2, req, &b);
+        Check("GetTaddressBalance matches oracle",
+              sl.ok() && so.ok() && a.valuezat() == b.valuezat(),
+              sl.ok() && so.ok() ? ("valueZat " + std::to_string(a.valuezat()))
+                                 : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // --- GetAddressUtxos (capped) — exercises txid reversal + field mapping ---
+    {
+        rpc::GetAddressUtxosArg req;
+        req.add_addresses(kAddr);
+        req.set_startheight(0);
+        req.set_maxentries(5);
+        rpc::GetAddressUtxosReplyList a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->GetAddressUtxos(&c1, req, &a);
+        auto so = O->GetAddressUtxos(&c2, req, &b);
+        Check("GetAddressUtxos(maxEntries=5) byte-identical to oracle",
+              sl.ok() && so.ok() && Ser(a) == Ser(b),
+              sl.ok() && so.ok()
+                  ? (std::to_string(a.addressutxos_size()) + " vs " +
+                     std::to_string(b.addressutxos_size()) + " utxos")
+                  : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // --- GetTransaction (txid is wire/little-endian in the request) ---
+    {
+        rpc::TxFilter req;
+        req.set_hash(Rev(Unhex(kTxidBE)));
+        rpc::RawTransaction a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->GetTransaction(&c1, req, &a);
+        auto so = O->GetTransaction(&c2, req, &b);
+        Check("GetTransaction byte-identical to oracle",
+              sl.ok() && so.ok() && Ser(a) == Ser(b),
+              sl.ok() && so.ok()
+                  ? ("data " + std::to_string(a.data().size()) + "B, height " +
+                     std::to_string(a.height()))
+                  : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // --- GetTaddressTxids over a narrow range: stream must match ---
+    {
+        rpc::TransparentAddressBlockFilter req;
+        req.set_address(kAddr);
+        req.mutable_range()->mutable_start()->set_height(1197000);
+        req.mutable_range()->mutable_end()->set_height(1197200);
+        grpc::ClientContext c1, c2;
+        auto lr = L->GetTaddressTxids(&c1, req);
+        auto orr = O->GetTaddressTxids(&c2, req);
+        rpc::RawTransaction la, ob;
+        uint64_t n = 0;
+        bool mismatch = false;
+        while (true) {
+            bool gl = lr->Read(&la);
+            bool go = orr->Read(&ob);
+            if (gl != go) { mismatch = true; break; }
+            if (!gl) break;
+            if (Ser(la) != Ser(ob)) { mismatch = true; break; }
+            ++n;
+        }
+        auto fl = lr->Finish();
+        auto fo = orr->Finish();
+        Check("GetTaddressTxids(1197000..1197200) stream matches oracle",
+              fl.ok() && fo.ok() && !mismatch,
+              mismatch ? "stream mismatch"
+                       : (std::to_string(n) + " transactions"));
     }
 
     std::cout << (g_fail == 0 ? "\nALL CHECKS PASSED\n"
