@@ -36,6 +36,7 @@ First build clones + statically builds gRPC/protobuf/abseil/curl from source
 # Dev shortcuts (insecure — do not use in production):
 ./build/lyghtd --gen-cert-very-insecure   # serve TLS with an in-memory self-signed cert
 ./build/lyghtd --no-tls-very-insecure      # serve plaintext, no TLS
+./build/lyghtd --ping-very-insecure        # enable the Ping latency RPC
 ```
 **TLS, matching lightwalletd.** TLS is required by default: `--tls-cert`/`--tls-key`
 (PEM, default `./cert.pem` / `./cert.key`) must exist, or lyghtd exits. The files
@@ -53,6 +54,29 @@ pipeline (one thread fetches the next batch while the writer parses+appends the
 current one, overlapping ycashd's work with ours); within the top 100 it
 switches to single-block fetch with reorg handling. SIGINT/SIGTERM shut it down
 cleanly. Default bind `127.0.0.1:19067` avoids the Go oracle on 9067/9068.
+
+## gRPC surface
+**Every method of the `CompactTxStreamer` service is implemented and validated
+byte-for-byte against the Go server** (`tools/grpc_diff`, 22 checks):
+
+- **Cache (no daemon):** GetLightdInfo, GetLatestBlock, GetBlock, GetBlockRange,
+  GetBlockNullifiers, GetBlockRangeNullifiers.
+- **Transparent address (ycashd insightexplorer):** GetTaddressBalance(+Stream),
+  GetTaddressTxids, GetTaddressTransactions, GetAddressUtxos(+Stream),
+  GetTransaction.
+- **Spend / sync:** SendTransaction, GetTreeState, GetLatestTreeState,
+  GetSubtreeRoots (`z_getsubtreesbyindex`).
+- **Mempool:** GetMempoolTx, GetMempoolStream (a shared-state monitor matching
+  lightwalletd's reset-then-stream semantics).
+- **Ping** — latency probe for client server-selection; opt-in via
+  `--ping-very-insecure`.
+
+Ycash specifics handled where they differ from Zcash: transparent addresses use
+the `s` prefix (`s1`/`s3`), there is no Orchard pool (z_gettreestate has no
+orchard tree), and V5 parsing is gated by NU5 activation height (absent on
+Ycash). The daemon-backed RPCs use a dedicated kept-alive ycashd connection,
+separate from the ingestor's; if ycashd is unreachable they return UNAVAILABLE
+while cache-only serving keeps working.
 
 ## Milestones
 - **0 — toolchain proof (done).** FetchContent static gRPC builds & links a
@@ -89,12 +113,17 @@ cleanly. Default bind `127.0.0.1:19067` avoids the Go oracle on 9067/9068.
   host went 677 → ~1305 (standard, drop-verbose) → ~1788 blk/s (compact),
   ~2.6× the original; lyghtd stays well under one core (ycashd is the wall).
   TLS serving mirrors lightwalletd (see Running).
+- **4 — full wallet RPC surface (done).** Every remaining RPC — the
+  transparent-address suite, the spend path, mempool, nullifier-only blocks,
+  subtree roots, and ping — implemented and validated byte-for-byte against the
+  Go oracle. See **gRPC surface** above. lyghtd is now a complete drop-in.
 
 ## Reference oracle
-A Go lightwalletd serving the validated cache runs at `127.0.0.1:9067`
-(plaintext; it also occupies 9068 on this host). Every milestone is validated
-by diffing C++ gRPC output against it. The milestone-0 stub binds
-`127.0.0.1:19067` by default to avoid colliding; override with `lyghtd <addr>`.
+A Go lightwalletd serving the same cache + ycashd runs at `127.0.0.1:9067`
+(plaintext; it also occupies 9068 on this host). Correctness is checked with
+`tools/grpc_diff`, which issues each request to lyghtd and the oracle and diffs
+the serialized responses (22 checks across the whole RPC surface). lyghtd binds
+`127.0.0.1:19067` by default to avoid colliding; override with `--bind`.
 
 ## License & acknowledgments
 lyghtd is released under the [MIT License](LICENSE), Copyright (c) 2026 Ycash
