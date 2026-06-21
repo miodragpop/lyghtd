@@ -374,6 +374,86 @@ int main(int argc, char** argv) {
                   std::to_string(ov.size()) + " txs");
     }
 
+    // ====================================================================
+    // Nullifier-only blocks (cache) / subtree roots / ping.
+    // ====================================================================
+
+    // --- GetBlockNullifiers: cache read + strip, byte-for-byte ---
+    {
+        rpc::BlockID req;
+        req.set_height(571100);
+        rpc::CompactBlock a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->GetBlockNullifiers(&c1, req, &a);
+        auto so = O->GetBlockNullifiers(&c2, req, &b);
+        Check("GetBlockNullifiers(571100) byte-identical to oracle",
+              sl.ok() && so.ok() && Ser(a) == Ser(b),
+              sl.ok() && so.ok() ? (std::to_string(Ser(a).size()) + "B")
+                                 : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // --- GetBlockRangeNullifiers: drain each (deadline-bounded; the oracle's
+    //     WIP stream may not close) then compare in order. ---
+    {
+        auto drain = [](rpc::CompactTxStreamer::Stub* s,
+                        std::vector<std::string>& out) {
+            rpc::BlockRange req;
+            req.mutable_start()->set_height(571000);
+            req.mutable_end()->set_height(571050);
+            grpc::ClientContext c;
+            c.set_deadline(std::chrono::system_clock::now() +
+                           std::chrono::seconds(8));
+            auto rd = s->GetBlockRangeNullifiers(&c, req);
+            rpc::CompactBlock blk;
+            while (rd->Read(&blk)) out.push_back(Ser(blk));
+            rd->Finish();
+        };
+        std::vector<std::string> lv, ov;
+        drain(L.get(), lv);
+        drain(O.get(), ov);
+        Check("GetBlockRangeNullifiers(571000..571050) matches oracle", lv == ov,
+              "lyghtd " + std::to_string(lv.size()) + " / oracle " +
+                  std::to_string(ov.size()) + " blocks");
+    }
+
+    // --- GetSubtreeRoots: drain each (deadline-bounded) then compare. ---
+    {
+        auto drain = [](rpc::CompactTxStreamer::Stub* s,
+                        std::vector<std::string>& out) {
+            rpc::GetSubtreeRootsArg req;
+            req.set_shieldedprotocol(rpc::sapling);
+            req.set_startindex(0);
+            req.set_maxentries(3);
+            grpc::ClientContext c;
+            c.set_deadline(std::chrono::system_clock::now() +
+                           std::chrono::seconds(8));
+            auto rd = s->GetSubtreeRoots(&c, req);
+            rpc::SubtreeRoot r;
+            while (rd->Read(&r)) out.push_back(Ser(r));
+            rd->Finish();
+        };
+        std::vector<std::string> lv, ov;
+        drain(L.get(), lv);
+        drain(O.get(), ov);
+        Check("GetSubtreeRoots(sapling,0,3) matches oracle", lv == ov,
+              "lyghtd " + std::to_string(lv.size()) + " / oracle " +
+                  std::to_string(ov.size()) + " roots");
+    }
+
+    // --- Ping: disabled on both (no --ping-very-insecure) => same status ---
+    {
+        rpc::Duration req;
+        req.set_intervalus(1000);
+        rpc::PingResponse a, b;
+        grpc::ClientContext c1, c2;
+        auto sl = L->Ping(&c1, req, &a);
+        auto so = O->Ping(&c2, req, &b);
+        Check("Ping (disabled) returns same status code as oracle",
+              sl.error_code() == so.error_code(),
+              "lyghtd " + std::to_string(sl.error_code()) + " / oracle " +
+                  std::to_string(so.error_code()));
+    }
+
     std::cout << (g_fail == 0 ? "\nALL CHECKS PASSED\n"
                               : "\n" + std::to_string(g_fail) + " CHECK(S) FAILED\n");
     return g_fail == 0 ? 0 : 1;

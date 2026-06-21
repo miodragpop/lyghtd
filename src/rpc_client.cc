@@ -185,6 +185,15 @@ struct UtxoJson {
     int64_t height = 0;
 };
 
+// z_getsubtreesbyindex result (pool/start_index ignored).
+struct SubtreeJson {
+    std::string root{};
+    uint64_t end_height = 0;
+};
+struct SubtreesReplyJson {
+    std::vector<SubtreeJson> subtrees{};
+};
+
 // z_gettreestate result (the fields we use; finalRoot/sprout are ignored).
 struct CommitmentsJson {
     std::string finalState{};
@@ -690,6 +699,28 @@ std::vector<std::string> RpcClient::GetRawMempool() {
         resp = HttpPost(SingleBody(++id_, "getrawmempool", "[]"));
     }
     return ParseReply<std::vector<std::string>>("getrawmempool", resp);
+}
+
+std::vector<Subtree> RpcClient::GetSubtreesByIndex(const std::string& protocol,
+                                                  uint32_t start_index,
+                                                  uint32_t max_entries) {
+    std::string params =
+        "[\"" + protocol + "\"," + std::to_string(start_index);
+    if (max_entries > 0) params += "," + std::to_string(max_entries);
+    params += "]";
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "z_getsubtreesbyindex", params));
+    }
+    SubtreesReplyJson j =
+        ParseReply<SubtreesReplyJson>("z_getsubtreesbyindex", resp);
+    std::vector<Subtree> out;
+    out.reserve(j.subtrees.size());
+    for (auto& s : j.subtrees) {
+        out.push_back({std::move(s.root), s.end_height});
+    }
+    return out;
 }
 
 }  // namespace lyghtd

@@ -63,6 +63,7 @@ void Usage(const char* argv0) {
         << "  --tls-key <path>    TLS key PEM (default ./cert.key)\n"
         << "  --gen-cert-very-insecure  serve TLS with an in-memory self-signed cert (dev)\n"
         << "  --no-tls-very-insecure    serve plaintext, no TLS (dev)\n"
+        << "  --ping-very-insecure      enable the Ping latency RPC (dev)\n"
         << "TLS is required by default: --tls-cert/--tls-key must exist unless a\n"
         << "-very-insecure flag is given.\n";
 }
@@ -94,6 +95,7 @@ int main(int argc, char** argv) {
     std::string tls_key = "./cert.key";
     bool no_tls = false;    // --no-tls-very-insecure: plaintext
     bool gen_cert = false;  // --gen-cert-very-insecure: in-memory self-signed
+    bool ping_enable = false;  // --ping-very-insecure: enable the Ping RPC
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -124,6 +126,8 @@ int main(int argc, char** argv) {
             no_tls = true;
         } else if (a == "--gen-cert-very-insecure") {
             gen_cert = true;
+        } else if (a == "--ping-very-insecure") {
+            ping_enable = true;
         } else if (a == "-h" || a == "--help") {
             Usage(argv[0]);
             return 0;
@@ -161,7 +165,8 @@ int main(int argc, char** argv) {
                   << "); transparent-address RPCs will return UNAVAILABLE\n";
     }
 
-    lyghtd::CompactTxStreamerImpl service(cache.get(), service_rpc.get());
+    lyghtd::CompactTxStreamerImpl service(cache.get(), service_rpc.get(),
+                                          ping_enable);
 
     grpc::EnableDefaultHealthCheckService(true);
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();

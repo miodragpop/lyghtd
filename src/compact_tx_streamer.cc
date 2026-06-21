@@ -239,6 +239,58 @@ bool FilterTxPool(const rpc::CompactTx& tx, const std::vector<int>& pools,
            out->outputs_size() || out->actions_size();
 }
 
+// Reduce a CompactBlock to nullifiers only (mirrors GetBlockNullifiers): keep
+// Sapling spends (already just `nf`) if `sapling`, reduce Orchard actions to
+// nullifier-only if `orchard`, drop outputs + transparent vin/vout, and zero the
+// tree sizes (the client doesn't need them here).
+void StripToNullifiers(rpc::CompactBlock* block, bool sapling, bool orchard) {
+    for (auto& tx : *block->mutable_vtx()) {
+        if (!sapling) tx.clear_spends();
+        tx.clear_outputs();
+        if (orchard) {
+            for (auto& a : *tx.mutable_actions()) {
+                std::string nf = a.nullifier();
+                a.Clear();
+                a.set_nullifier(nf);
+            }
+        } else {
+            tx.clear_actions();
+        }
+        tx.clear_vin();
+        tx.clear_vout();
+    }
+    if (block->has_chainmetadata()) {
+        block->mutable_chainmetadata()->set_saplingcommitmenttreesize(0);
+        block->mutable_chainmetadata()->set_orchardcommitmenttreesize(0);
+    }
+}
+
+// The range variant of the strip: unlike the unary GetBlockNullifiers (which
+// keeps every tx), Go's GetBlockRangeNullifiers runs blocks through GetBlockRange
+// with the (transparent-filtered) pool set, which DROPS txs with no requested-
+// pool data, then strips outputs + reduces actions to nullifiers. So apply
+// FilterTxPool per tx (dropping non-matching), then strip.
+void StripRangeNullifiers(rpc::CompactBlock* block,
+                          const std::vector<int>& pools) {
+    google::protobuf::RepeatedPtrField<rpc::CompactTx> kept;
+    for (const auto& tx : block->vtx()) {
+        rpc::CompactTx ftx;
+        if (!FilterTxPool(tx, pools, &ftx)) continue;  // drop (no requested pool)
+        ftx.clear_outputs();
+        for (auto& a : *ftx.mutable_actions()) {
+            std::string nf = a.nullifier();
+            a.Clear();
+            a.set_nullifier(nf);
+        }
+        *kept.Add() = std::move(ftx);
+    }
+    block->mutable_vtx()->Swap(&kept);
+    if (block->has_chainmetadata()) {
+        block->mutable_chainmetadata()->set_saplingcommitmenttreesize(0);
+        block->mutable_chainmetadata()->set_orchardcommitmenttreesize(0);
+    }
+}
+
 }  // namespace
 
 grpc::Status CompactTxStreamerImpl::GetLightdInfo(grpc::ServerContext*,
@@ -685,6 +737,151 @@ grpc::Status CompactTxStreamerImpl::GetMempoolStream(
         lk.lock();
         if (mempool_last_hash_ != stay_hash) break;  // block changed under us
     }
+    return grpc::Status::OK;
+}
+
+// ---- Nullifier-only blocks / subtree roots / ping ----
+
+grpc::Status CompactTxStreamerImpl::GetBlockNullifiers(grpc::ServerContext*,
+                                                       const rpc::BlockID* req,
+                                                       rpc::CompactBlock* resp) {
+    if (req->height() == 0 && req->hash().empty()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "GetBlockNullifiers: must specify a block height");
+    }
+    if (!req->hash().empty()) {
+        return grpc::Status(
+            grpc::StatusCode::INVALID_ARGUMENT,
+            "GetBlockNullifiers: GetBlock by Hash is not yet implemented");
+    }
+    std::optional<rpc::CompactBlock> block;
+    try {
+        block = cache_->Get(req->height());
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+    }
+    if (!block.has_value()) {
+        return grpc::Status(grpc::StatusCode::OUT_OF_RANGE,
+                            "GetBlockNullifiers: block " +
+                                std::to_string(req->height()) +
+                                " is newer than the latest block");
+    }
+    StripToNullifiers(&block.value(), /*sapling=*/true, /*orchard=*/true);
+    *resp = std::move(*block);
+    return grpc::Status::OK;
+}
+
+grpc::Status CompactTxStreamerImpl::GetBlockRangeNullifiers(
+    grpc::ServerContext* ctx, const rpc::BlockRange* req,
+    grpc::ServerWriter<rpc::CompactBlock>* writer) {
+    if (!req->has_start() || !req->has_end()) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "GetBlockRangeNullifiers: must specify start and "
+                            "end heights");
+    }
+    // poolTypes minus TRANSPARENT (this RPC returns only nullifiers); an empty
+    // result means "shielded" (both), matching Go's filtered GetBlockRange.
+    bool want_sapling = false, want_orchard = false;
+    for (int p : req->pooltypes()) {
+        if (p == rpc::SAPLING) want_sapling = true;
+        else if (p == rpc::ORCHARD) want_orchard = true;
+    }
+    if (!want_sapling && !want_orchard) { want_sapling = want_orchard = true; }
+    std::vector<int> pools;
+    if (want_sapling) pools.push_back(rpc::SAPLING);
+    if (want_orchard) pools.push_back(rpc::ORCHARD);
+
+    const uint64_t start = req->start().height();
+    const uint64_t end = req->end().height();
+    const bool reversed = start > end;
+    const uint64_t low = reversed ? end : start;
+    const uint64_t high = reversed ? start : end;
+    for (uint64_t i = low; i <= high; ++i) {
+        if (ctx->IsCancelled()) {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "client cancelled");
+        }
+        const uint64_t h = reversed ? (high - (i - low)) : i;
+        std::optional<rpc::CompactBlock> block;
+        try {
+            block = cache_->Get(h);
+        } catch (const std::exception& e) {
+            return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+        }
+        if (!block.has_value()) {
+            return grpc::Status(grpc::StatusCode::OUT_OF_RANGE,
+                                "GetBlockRangeNullifiers: block " +
+                                    std::to_string(h) +
+                                    " is newer than the latest block");
+        }
+        StripRangeNullifiers(&block.value(), pools);
+        if (!writer->Write(*block)) {
+            return grpc::Status(grpc::StatusCode::UNKNOWN, "stream write failed");
+        }
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status CompactTxStreamerImpl::GetSubtreeRoots(
+    grpc::ServerContext* ctx, const rpc::GetSubtreeRootsArg* req,
+    grpc::ServerWriter<rpc::SubtreeRoot>* writer) {
+    if (!rpc_) return NoRpc();
+    std::string protocol;
+    if (req->shieldedprotocol() == rpc::sapling) {
+        protocol = "sapling";
+    } else if (req->shieldedprotocol() == rpc::orchard) {
+        protocol = "orchard";
+    } else {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "unrecognized shielded protocol");
+    }
+    std::vector<Subtree> subtrees;
+    try {
+        subtrees = rpc_->GetSubtreesByIndex(protocol, req->startindex(),
+                                            req->maxentries());
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            std::string("z_getsubtreesbyindex: ") + e.what());
+    }
+    for (const auto& st : subtrees) {
+        if (ctx->IsCancelled()) {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "client cancelled");
+        }
+        std::optional<rpc::CompactBlock> block;
+        try {
+            block = cache_->Get(st.end_height);
+        } catch (const std::exception& e) {
+            return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+        }
+        if (!block.has_value()) {
+            return grpc::Status(grpc::StatusCode::INTERNAL,
+                                "GetSubtreeRoots: completing block " +
+                                    std::to_string(st.end_height) +
+                                    " not in cache");
+        }
+        rpc::SubtreeRoot r;
+        r.set_roothash(HexDecode(st.root));
+        // block.hash is wire order; completingBlockHash is big-endian display.
+        r.set_completingblockhash(Reversed(block->hash()));
+        r.set_completingblockheight(block->height());
+        if (!writer->Write(r)) {
+            return grpc::Status(grpc::StatusCode::UNKNOWN, "stream write failed");
+        }
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status CompactTxStreamerImpl::Ping(grpc::ServerContext*,
+                                         const rpc::Duration* req,
+                                         rpc::PingResponse* resp) {
+    // Ping can spawn unbounded concurrent sleeping threads, so it's opt-in.
+    if (!ping_enable_) {
+        return grpc::Status(
+            grpc::StatusCode::FAILED_PRECONDITION,
+            "Ping not enabled, start lyghtd with --ping-very-insecure");
+    }
+    resp->set_entry(ping_concurrent_.fetch_add(1) + 1);
+    std::this_thread::sleep_for(std::chrono::microseconds(req->intervalus()));
+    resp->set_exit(ping_concurrent_.fetch_sub(1) - 1);
     return grpc::Status::OK;
 }
 

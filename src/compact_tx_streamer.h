@@ -6,7 +6,9 @@
 // GetTaddress*, GetAddressUtxos*) proxies ycashd via an optional RpcClient; if
 // none is wired (no reachable daemon) those return UNAVAILABLE.
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <set>
 #include <string>
@@ -21,9 +23,11 @@ namespace lyghtd {
 class CompactTxStreamerImpl final : public rpc::CompactTxStreamer::Service {
 public:
     // `rpc` may be null (cache-only serving); the daemon-backed RPCs then fail
-    // with UNAVAILABLE. Neither pointer is owned.
-    explicit CompactTxStreamerImpl(BlockCache* cache, RpcClient* rpc = nullptr)
-        : cache_(cache), rpc_(rpc) {}
+    // with UNAVAILABLE. Neither pointer is owned. `ping_enable` gates the Ping
+    // RPC (lightwalletd --ping-very-insecure); off by default.
+    explicit CompactTxStreamerImpl(BlockCache* cache, RpcClient* rpc = nullptr,
+                                   bool ping_enable = false)
+        : cache_(cache), rpc_(rpc), ping_enable_(ping_enable) {}
 
     grpc::Status GetLightdInfo(grpc::ServerContext* ctx, const rpc::Empty* req,
                                rpc::LightdInfo* resp) override;
@@ -92,6 +96,23 @@ public:
         grpc::ServerContext* ctx, const rpc::Empty* req,
         grpc::ServerWriter<rpc::RawTransaction>* writer) override;
 
+    // ---- Nullifier-only blocks (cache) / subtree roots / ping ----
+
+    grpc::Status GetBlockNullifiers(grpc::ServerContext* ctx,
+                                    const rpc::BlockID* req,
+                                    rpc::CompactBlock* resp) override;
+
+    grpc::Status GetBlockRangeNullifiers(
+        grpc::ServerContext* ctx, const rpc::BlockRange* req,
+        grpc::ServerWriter<rpc::CompactBlock>* writer) override;
+
+    grpc::Status GetSubtreeRoots(
+        grpc::ServerContext* ctx, const rpc::GetSubtreeRootsArg* req,
+        grpc::ServerWriter<rpc::SubtreeRoot>* writer) override;
+
+    grpc::Status Ping(grpc::ServerContext* ctx, const rpc::Duration* req,
+                      rpc::PingResponse* resp) override;
+
 private:
     // Fetch any newly-seen mempool txs into mempool_list_. Caller holds
     // mempool_mu_. Mirrors Go's refreshMempoolTxns. Throws on RPC error.
@@ -99,6 +120,8 @@ private:
 
     BlockCache* cache_;  // not owned
     RpcClient* rpc_;     // not owned; may be null (cache-only serving)
+    bool ping_enable_;   // gates the Ping RPC
+    std::atomic<int64_t> ping_concurrent_{0};  // in-flight Ping count
 
     // Shared GetMempoolStream state (mirrors Go lightwalletd's package globals),
     // so the first stream after a new block resets and returns, and concurrent

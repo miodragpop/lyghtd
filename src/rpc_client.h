@@ -85,6 +85,13 @@ struct SendResult {
     std::string error_message;
 };
 
+// One z_getsubtreesbyindex entry: the subtree Merkle root (hex) and the height
+// of the block that completed it.
+struct Subtree {
+    std::string root;  // hex
+    uint64_t end_height = 0;
+};
+
 class RpcClient {
 public:
     // Build a client from a ycashd/zcashd conf file (rpcuser/rpcpassword/rpcport).
@@ -186,6 +193,12 @@ public:
 
     // getrawmempool — txids currently in the mempool (big-endian display hex).
     std::vector<std::string> GetRawMempool();
+
+    // z_getsubtreesbyindex <protocol> <startIndex> [<maxEntries>] — note-
+    // commitment subtree roots for "sapling"/"orchard" from `start_index`.
+    std::vector<Subtree> GetSubtreesByIndex(const std::string& protocol,
+                                            uint32_t start_index,
+                                            uint32_t max_entries);
 
     const std::string& host() const { return host_; }
     int port() const { return port_; }
