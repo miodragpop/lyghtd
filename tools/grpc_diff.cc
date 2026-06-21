@@ -10,10 +10,12 @@
 // lyghtd's snapshot; the tool checks lyghtd's tip block against the oracle's
 // block AT THAT SAME HEIGHT instead, which must match.
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include "service.grpc.pb.h"
@@ -310,6 +312,66 @@ int main(int argc, char** argv) {
                   ? ("code " + std::to_string(a.errorcode()) + " msg '" +
                      a.errormessage() + "'")
                   : (sl.error_message() + " / " + so.error_message()));
+    }
+
+    // ====================================================================
+    // Mempool (daemon-backed). Both proxy the same ycashd mempool.
+    // ====================================================================
+
+    // --- GetMempoolTx: compact-tx stream, byte-for-byte ---
+    {
+        rpc::GetMempoolTxRequest req;  // no excludes, default (shielded) pools
+        grpc::ClientContext c1, c2;
+        auto lr = L->GetMempoolTx(&c1, req);
+        auto orr = O->GetMempoolTx(&c2, req);
+        rpc::CompactTx la, ob;
+        uint64_t n = 0;
+        bool mismatch = false;
+        while (true) {
+            bool gl = lr->Read(&la), go = orr->Read(&ob);
+            if (gl != go) { mismatch = true; break; }
+            if (!gl) break;
+            if (Ser(la) != Ser(ob)) { mismatch = true; break; }
+            ++n;
+        }
+        auto fl = lr->Finish(), fo = orr->Finish();
+        Check("GetMempoolTx stream matches oracle",
+              fl.ok() && fo.ok() && !mismatch,
+              mismatch ? "stream mismatch"
+                       : (std::to_string(n) + " shielded mempool txs"));
+    }
+
+    // --- GetMempoolStream: warm-up (resets shared state to the current block),
+    //     then a deadline-bounded real stream; compare the tx set. ---
+    {
+        auto drain = [](rpc::CompactTxStreamer::Stub* s,
+                        std::vector<std::string>& out) {
+            {  // warm-up: sync the monitor's shared state to the current block
+                grpc::ClientContext wc;
+                wc.set_deadline(std::chrono::system_clock::now() +
+                                std::chrono::milliseconds(700));
+                auto rd = s->GetMempoolStream(&wc, rpc::Empty());
+                rpc::RawTransaction t;
+                while (rd->Read(&t)) {
+                }
+                rd->Finish();
+            }
+            grpc::ClientContext c;
+            c.set_deadline(std::chrono::system_clock::now() +
+                           std::chrono::milliseconds(2200));
+            auto rd = s->GetMempoolStream(&c, rpc::Empty());
+            rpc::RawTransaction t;
+            while (rd->Read(&t)) out.push_back(Ser(t));
+            rd->Finish();
+        };
+        std::vector<std::string> lv, ov;
+        drain(L.get(), lv);
+        drain(O.get(), ov);
+        std::sort(lv.begin(), lv.end());
+        std::sort(ov.begin(), ov.end());
+        Check("GetMempoolStream matches oracle (warm-up + 2s window)", lv == ov,
+              "lyghtd " + std::to_string(lv.size()) + " / oracle " +
+                  std::to_string(ov.size()) + " txs");
     }
 
     std::cout << (g_fail == 0 ? "\nALL CHECKS PASSED\n"

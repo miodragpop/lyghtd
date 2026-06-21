@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <exception>
 #include <functional>
+#include <map>
+#include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "block_parser.h"
 #include "Version.h"
 
 namespace lyghtd {
@@ -173,6 +178,65 @@ grpc::Status ForEachUtxo(
         if (!s.ok()) return s;
     }
     return grpc::Status::OK;
+}
+
+// ---- Mempool helpers ----
+
+// Port of Go lightwalletd's MempoolFilter: return the items (mempool txids, as
+// big-endian hex) NOT excluded. An item is excluded only if it is UNIQUELY
+// prefix-matched by an exclude string (so an ambiguous prefix matching >1 item
+// is not excluded — the client might be missing one of them).
+std::vector<std::string> MempoolFilter(std::vector<std::string> items,
+                                       std::vector<std::string> exclude) {
+    std::sort(items.begin(), items.end());
+    std::sort(exclude.begin(), exclude.end());
+    auto less_than = [](const std::string& e, const std::string& i) {
+        size_t l = std::min(e.size(), i.size());
+        return e < i.substr(0, l);
+    };
+    auto has_prefix = [](const std::string& i, const std::string& e) {
+        return i.size() >= e.size() && i.compare(0, e.size(), e) == 0;
+    };
+    std::vector<int> nmatches(exclude.size(), 0);
+    size_t ei = 0;
+    for (const auto& item : items) {
+        while (ei < exclude.size() && less_than(exclude[ei], item)) ++ei;
+        if (ei < exclude.size() && has_prefix(item, exclude[ei])) ++nmatches[ei];
+    }
+    std::vector<std::string> tosend;
+    ei = 0;
+    for (const auto& item : items) {
+        while (ei < exclude.size() && less_than(exclude[ei], item)) ++ei;
+        bool match = ei < exclude.size() && has_prefix(item, exclude[ei]);
+        if (!match || nmatches[ei] > 1) tosend.push_back(item);
+    }
+    return tosend;
+}
+
+// Port of FilterTxPool: prune a CompactTx to the requested pools. Returns false
+// (nothing to send) if no requested-pool data remains.
+bool FilterTxPool(const rpc::CompactTx& tx, const std::vector<int>& pools,
+                  rpc::CompactTx* out) {
+    auto want = [&](int p) {
+        return std::find(pools.begin(), pools.end(), p) != pools.end();
+    };
+    out->Clear();
+    out->set_index(tx.index());
+    out->set_txid(tx.txid());
+    out->set_fee(tx.fee());
+    if (want(rpc::TRANSPARENT)) {
+        *out->mutable_vin() = tx.vin();
+        *out->mutable_vout() = tx.vout();
+    }
+    if (want(rpc::SAPLING)) {
+        *out->mutable_spends() = tx.spends();
+        *out->mutable_outputs() = tx.outputs();
+    }
+    if (want(rpc::ORCHARD)) {
+        *out->mutable_actions() = tx.actions();
+    }
+    return out->vin_size() || out->vout_size() || out->spends_size() ||
+           out->outputs_size() || out->actions_size();
 }
 
 }  // namespace
@@ -480,6 +544,148 @@ grpc::Status CompactTxStreamerImpl::GetLatestTreeState(grpc::ServerContext* ctx,
     rpc::BlockID id;
     id.set_height(tip);
     return GetTreeState(ctx, &id, resp);
+}
+
+// ---- Mempool (daemon-backed) ----
+
+grpc::Status CompactTxStreamerImpl::GetMempoolTx(
+    grpc::ServerContext*, const rpc::GetMempoolTxRequest* req,
+    grpc::ServerWriter<rpc::CompactTx>* writer) {
+    if (!rpc_) return NoRpc();
+    for (int i = 0; i < req->exclude_txid_suffixes_size(); ++i) {
+        if (req->exclude_txid_suffixes(i).size() > 32) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "exclude txid is larger than 32 bytes");
+        }
+    }
+    std::vector<int> pools;
+    for (int p : req->pooltypes()) {
+        if (p == rpc::POOL_TYPE_INVALID) {
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                "invalid pool type requested");
+        }
+        pools.push_back(p);
+    }
+    if (pools.empty()) pools = {rpc::SAPLING, rpc::ORCHARD};  // legacy: shielded
+
+    std::vector<std::string> txids;
+    try {
+        txids = rpc_->GetRawMempool();
+    } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            std::string("getrawmempool error: ") + e.what());
+    }
+    // Fetch + parse each mempool tx into a CompactTx (keyed by big-endian txid).
+    std::map<std::string, rpc::CompactTx> by_txid;
+    for (const auto& txid : txids) {
+        RawTx t;
+        try {
+            t = rpc_->GetRawTransaction(txid);
+        } catch (const std::exception&) {
+            continue;  // mempool txs can disappear; not an error
+        }
+        try {
+            by_txid[txid] = ParseTransactionToCompact(t.data,
+                                                      Reversed(HexDecode(txid)));
+        } catch (const std::exception& e) {
+            return grpc::Status(grpc::StatusCode::INTERNAL,
+                                std::string("parse mempool tx: ") + e.what());
+        }
+    }
+    // Exclude suffixes are reversed + hex-encoded into txid-hex prefixes.
+    std::vector<std::string> exclude_hex;
+    for (int i = 0; i < req->exclude_txid_suffixes_size(); ++i) {
+        exclude_hex.push_back(ToHex(Reversed(req->exclude_txid_suffixes(i))));
+    }
+    for (const auto& txid : MempoolFilter(txids, exclude_hex)) {
+        auto it = by_txid.find(txid);
+        if (it == by_txid.end()) continue;
+        rpc::CompactTx ftx;
+        if (FilterTxPool(it->second, pools, &ftx)) {
+            if (!writer->Write(ftx)) {
+                return grpc::Status(grpc::StatusCode::UNKNOWN,
+                                    "stream write failed");
+            }
+        }
+    }
+    return grpc::Status::OK;
+}
+
+void CompactTxStreamerImpl::RefreshMempoolLocked() {
+    std::vector<std::string> txids = rpc_->GetRawMempool();
+    for (const auto& txid : txids) {
+        if (!mempool_seen_.insert(txid).second) continue;  // already fetched
+        RawTx t;
+        try {
+            t = rpc_->GetRawTransaction(txid);
+        } catch (const std::exception&) {
+            continue;  // mempool txs can disappear; not an error
+        }
+        if (t.height != 0) continue;  // mined since the list was fetched
+        rpc::RawTransaction rt;
+        rt.set_data(t.data);
+        rt.set_height(static_cast<uint64_t>(t.height));  // 0 = mempool
+        mempool_list_.push_back(std::move(rt));
+    }
+}
+
+grpc::Status CompactTxStreamerImpl::GetMempoolStream(
+    grpc::ServerContext* ctx, const rpc::Empty*,
+    grpc::ServerWriter<rpc::RawTransaction>* writer) {
+    if (!rpc_) return NoRpc();
+    using clk = std::chrono::steady_clock;
+    // Shared-state monitor (mirrors Go's GetMempool): the first stream after a
+    // new block resets state and returns; later streams in the same interval
+    // emit the mempool until the next block. Concurrent streams share one view.
+    std::unique_lock<std::mutex> lk(mempool_mu_);
+    size_t index = 0;
+    const std::string stay_hash = mempool_last_hash_;
+    for (;;) {
+        if (ctx->IsCancelled()) {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "client cancelled");
+        }
+        if (clk::now() - mempool_last_fetch_ >= std::chrono::seconds(2)) {
+            std::string best;
+            try {
+                best = rpc_->GetBestBlockHash();
+            } catch (const std::exception& e) {
+                return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
+            }
+            if (mempool_last_hash_ != best) {
+                // A new block arrived: reset shared state and end this stream.
+                mempool_last_hash_ = best;
+                mempool_seen_.clear();
+                mempool_list_.clear();
+                mempool_last_fetch_ = clk::time_point{};  // epoch
+                break;
+            }
+            try {
+                RefreshMempoolLocked();
+            } catch (const std::exception& e) {
+                return grpc::Status(grpc::StatusCode::UNAVAILABLE, e.what());
+            }
+            mempool_last_fetch_ = clk::now();
+        }
+        // Send entries this stream hasn't sent yet, without holding the lock.
+        const size_t start = std::min(index, mempool_list_.size());
+        std::vector<rpc::RawTransaction> to_send(mempool_list_.begin() + start,
+                                                 mempool_list_.end());
+        index = mempool_list_.size();
+        lk.unlock();
+        for (const auto& tx : to_send) {
+            if (!writer->Write(tx)) return grpc::Status::OK;  // client gone
+        }
+        // Cancel-aware ~200ms sleep.
+        for (int i = 0; i < 4 && !ctx->IsCancelled(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (ctx->IsCancelled()) {
+            return grpc::Status(grpc::StatusCode::CANCELLED, "client cancelled");
+        }
+        lk.lock();
+        if (mempool_last_hash_ != stay_hash) break;  // block changed under us
+    }
+    return grpc::Status::OK;
 }
 
 }  // namespace lyghtd

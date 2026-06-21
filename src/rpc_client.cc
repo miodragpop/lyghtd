@@ -683,4 +683,13 @@ SendResult RpcClient::SendRawTransaction(const std::string& tx_hex) {
     return out;
 }
 
+std::vector<std::string> RpcClient::GetRawMempool() {
+    std::string resp;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        resp = HttpPost(SingleBody(++id_, "getrawmempool", "[]"));
+    }
+    return ParseReply<std::vector<std::string>>("getrawmempool", resp);
+}
+
 }  // namespace lyghtd

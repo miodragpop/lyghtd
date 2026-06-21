@@ -29,6 +29,15 @@ namespace rpc = cash::z::wallet::sdk::rpc;
 // i.e. no NU5 — correct for Ycash. Set once at startup from the daemon.
 void SetNU5ActivationHeight(uint64_t height);
 
+// Parse a standalone transaction (e.g. from the mempool) into a CompactTx.
+// `wire_txid` is the 32-byte txid in wire (little-endian) order, stored as-is
+// (matching Go's mempool path, which takes the txid from getrawmempool rather
+// than recomputing it). Index is 0, so transparent inputs are omitted — exactly
+// like Go's tx.ToCompact(0). V5/Orchard parsing follows the configured NU5
+// height (the mempool sits at the tip). Throws on malformed/trailing data.
+rpc::CompactTx ParseTransactionToCompact(std::string_view raw_tx,
+                                         const std::string& wire_txid);
+
 // Parse a full block into its CompactBlock. Throws std::runtime_error on any
 // malformed/short data or an unexpected height/txcount mismatch.
 //

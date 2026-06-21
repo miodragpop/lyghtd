@@ -322,6 +322,24 @@ void SetNU5ActivationHeight(uint64_t height) {
     g_nu5_height.store(height, std::memory_order_relaxed);
 }
 
+rpc::CompactTx ParseTransactionToCompact(std::string_view raw_tx,
+                                         const std::string& wire_txid) {
+    // The mempool is at the tip, so V5 parsing follows whether this chain has
+    // an NU5 at all (UINT64_MAX = no NU5 = Ycash -> never V5).
+    const bool nu5_active =
+        g_nu5_height.load(std::memory_order_relaxed) != UINT64_MAX;
+    ByteString s(raw_tx);
+    Tx tx;
+    ParseTransaction(s, tx, nu5_active);
+    if (s.size() != 0) {
+        throw std::runtime_error(
+            "ParseTransactionToCompact: trailing data after transaction");
+    }
+    rpc::CompactTx ctx;
+    ToCompactTx(tx, /*index=*/0, wire_txid, &ctx);
+    return ctx;
+}
+
 rpc::CompactBlock ParseBlockToCompact(
     std::string_view raw, uint64_t height, uint32_t& sapling_tree_size,
     uint32_t& orchard_tree_size,

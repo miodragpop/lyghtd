@@ -184,6 +184,9 @@ public:
     // throwing on an RPC-level rejection (the caller maps it into SendResponse).
     SendResult SendRawTransaction(const std::string& tx_hex);
 
+    // getrawmempool — txids currently in the mempool (big-endian display hex).
+    std::vector<std::string> GetRawMempool();
+
     const std::string& host() const { return host_; }
     int port() const { return port_; }
 
