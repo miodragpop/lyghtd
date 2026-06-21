@@ -223,7 +223,7 @@ install(TARGETS lyghtd DESTINATION bin)
 # exactly the same compiled code as the server. See tools/README.md.
 option(LYGHTD_BUILD_TOOLS "Build dev/regression-testing tools in tools/" OFF)
 if(LYGHTD_BUILD_TOOLS)
-    foreach(_tool rpc_smoke parse_validate cache_validate bench_client grpc_diff ingest_profile)
+    foreach(_tool rpc_smoke parse_validate cache_validate bench_client grpc_diff ingest_profile taddr_bench)
         add_executable(${_tool} tools/${_tool}.cc)
         target_link_libraries(${_tool} PRIVATE lyghtd_core)
     endforeach()
