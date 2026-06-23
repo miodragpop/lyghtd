@@ -308,6 +308,20 @@ grpc::Status CompactTxStreamerImpl::GetLightdInfo(grpc::ServerContext*,
         // tip (cache is at tip when synced).
         resp->set_estimatedheight(*tip);
     }
+    // zcashdBuild/zcashdSubversion: Go lightwalletd fills these from the daemon's
+    // getinfo, and clients (ywallet's server-latency probe among them) read them
+    // to validate the backing node — an empty subversion makes ywallet refuse to
+    // show the server's ping. Best effort: if no daemon is wired or it's briefly
+    // unreachable, leave them empty rather than fail the whole call.
+    if (rpc_) {
+        try {
+            DaemonInfo di = rpc_->GetInfo();
+            resp->set_zcashdbuild(di.build);
+            resp->set_zcashdsubversion(di.subversion);
+        } catch (const std::exception&) {
+            // Serving info above is still valid; just skip the daemon fields.
+        }
+    }
     return grpc::Status::OK;
 }
 

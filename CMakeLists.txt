@@ -55,6 +55,17 @@ include(FetchContent)
 # clone (would otherwise require rm -rf build/_deps/<dep>-* to pick up a bump).
 set(FETCHCONTENT_UPDATES_DISCONNECTED OFF)
 
+# Silence two harmless-but-noisy warning categories that the vendored gRPC /
+# abseil / protobuf tree emits in a flood under GCC: -Wattributes (visibility
+# / ABI attribute mismatches) and -Wmissing-requires (concept constraints).
+# FetchContent_MakeAvailable() pulls each dep in via add_subdirectory(), and a
+# subdirectory captures CMAKE_CXX_FLAGS as it stands when it is added. So we
+# append the suppressions here, before any fetch, and restore the original
+# value right after the last one — the dep subdirectories inherit the quiet
+# flags while our own targets keep the full -Wall -Wextra (set per-target below).
+set(_LYGHTD_SAVED_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+string(APPEND CMAKE_CXX_FLAGS " -Wno-attributes -Wno-missing-requires")
+
 # gRPC's own knobs: build only what we need, link static, and reuse the
 # system zlib/OpenSSL/c-ares/re2 if present is NOT what we want here — we
 # vendor everything so the binary is a true drop-in. gRPC bundles them.
@@ -120,6 +131,10 @@ FetchContent_Declare(glaze
 )
 message(STATUS "Fetching glaze v7.7.0 (header-only)...")
 FetchContent_MakeAvailable(glaze)
+
+# Done fetching deps — restore the original flags so lyghtd's own translation
+# units compile under the full warning set.
+set(CMAKE_CXX_FLAGS "${_LYGHTD_SAVED_CXX_FLAGS}")
 
 # Aliases for the codegen plugins, regardless of whether gRPC exported them
 # as targets or we have to point at the built executables.
@@ -223,7 +238,7 @@ install(TARGETS lyghtd DESTINATION bin)
 # exactly the same compiled code as the server. See tools/README.md.
 option(LYGHTD_BUILD_TOOLS "Build dev/regression-testing tools in tools/" OFF)
 if(LYGHTD_BUILD_TOOLS)
-    foreach(_tool rpc_smoke parse_validate cache_validate bench_client grpc_diff ingest_profile taddr_bench)
+    foreach(_tool rpc_smoke parse_validate cache_validate bench_client grpc_diff ingest_profile taddr_bench info_probe)
         add_executable(${_tool} tools/${_tool}.cc)
         target_link_libraries(${_tool} PRIVATE lyghtd_core)
     endforeach()
